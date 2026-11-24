@@ -114,9 +114,9 @@ function, e.g. `.../0000:03:00.0/0000:04:00.0/i2c-21`.
 | `/usr/local/bin/cc-gigabyte-gpu-rgb` | binary | unit `ExecStart=` |
 | `/etc/systemd/system/cc-gigabyte-gpu-rgb.service` | unit | |
 | `/etc/modules-load.d/cc-gigabyte-gpu-rgb.conf` | loads `i2c-dev` at boot | |
-| `/var/lib/coolercontrol/plugins/gigabyte-gpu-rgb/gigabyte-gpu-rgb.sock` | socket | `dist/manifest.toml` (`address`), unit (`--socket`, `ReadWritePaths=`), `DEFAULT_SOCKET` in `src/lib.rs`, `SOCKET_DIR` in the Makefile |
-| `<plugins dir>/gigabyte-gpu-rgb/manifest.toml` | manifest | `MANIFEST_PLUGINS_DIR` in the Makefile |
-| `/var/lib/cc-gigabyte-gpu-rgb/` | auto-save records | unit `StateDirectory=`, `DEFAULT_STATE_DIR` in `src/autosave.rs`, `STATE_DIR` in the Makefile |
+| `/var/lib/coolercontrol/plugins/gigabyte-gpu-rgb/gigabyte-gpu-rgb.sock` | socket | `dist/manifest.toml` (`address`), unit (`--socket`, `ReadWritePaths=`), `DEFAULT_SOCKET` in `src/lib.rs`, `SOCKET_DIR` in `install.sh` |
+| `<plugins dir>/gigabyte-gpu-rgb/manifest.toml` | manifest | chosen by `install.sh` (below); `--manifest-dir` / `MANIFEST_PLUGINS_DIR` override |
+| `/var/lib/cc-gigabyte-gpu-rgb/` | auto-save records | unit `StateDirectory=`, `DEFAULT_STATE_DIR` in `src/autosave.rs`, `STATE_DIR` in `install.sh` |
 
 The binary is not put in the plugins directory. On SELinux systems files there are
 labelled `var_lib_t`, which systemd cannot execute (`status=203/EXEC`).
@@ -130,6 +130,52 @@ labelled `var_lib_t`, which systemd cannot execute (`status=203/EXEC`).
 to be bind-mounted into the container at the same path so that `address` resolves
 there. A path-based Unix socket works across network namespaces, so the plugin's
 `PrivateNetwork=yes` does not get in the way.
+
+### How install.sh picks the manifest directory
+
+Checked against the CoolerControl daemon source at tag 5.1.2
+(`coolercontrold/daemon/src/paths.rs`, `main.rs`, and the Docker Hub image files
+`.gitlab/images/dockerhub/{debian,alpine}/Dockerfile`):
+
+- config dir = `$CC_CONFIG_DIR` or `/etc/coolercontrol`; data dir = `$CC_DATA_DIR` or
+  `/var/lib/coolercontrol`.
+- plugins dir (scanned) = `$CC_PLUGINS_DIR` or `<data dir>/plugins`. The "legacy" dir
+  is always `<config dir>/plugins`.
+- At startup `ensure_plugins_dir` → `migrate_plugins_dir(canonical, legacy)`:
+  1. It creates the plugins dir.
+  2. If the two paths are equal, it stops there.
+  3. Otherwise, if the legacy path is a symlink to the plugins dir, nothing more
+     happens. A stale symlink is replaced. A real legacy directory has its entries
+     moved into the plugins dir and is removed (if removal fails, it is left in place
+     and no symlink is made).
+  4. It then creates the symlink `legacy -> plugins dir`.
+- The official images set `ENV CC_DATA_DIR=/etc/coolercontrol`, so plugins dir ==
+  legacy == `/etc/coolercontrol/plugins`, a real directory, and no symlink is made.
+
+So, once the daemon has run, `/etc/coolercontrol/plugins` is a symlink to the scanned
+directory on a native install, and the scanned directory itself in the official
+container. `install.sh` uses:
+
+1. `--manifest-dir` / `MANIFEST_PLUGINS_DIR` if given;
+2. else, if `/etc/coolercontrol/plugins` is a symlink, its target (resolved one level,
+   and kept inside `DESTDIR` when staging);
+3. else, if it is a real directory, `/etc/coolercontrol/plugins` (warning when a native
+   `coolercontrold` is on `PATH`, since that could also be a native install whose
+   migration left the directory behind);
+4. else `/var/lib/coolercontrol/plugins`.
+
+It prints the choice and the reason. Where it can be wrong:
+
+- The daemon has never run, so the path does not exist yet: a container install then
+  gets `/var/lib`. Start the daemon once first, or pass `--manifest-dir`.
+- The container's `/etc/coolercontrol` comes from a different host directory.
+- `CC_PLUGINS_DIR` or `CC_CONFIG_DIR` point somewhere custom.
+- A native install's legacy directory could not be removed by the migration.
+
+In all of these, use `--manifest-dir`. A manifest left by an earlier install in the
+socket directory is removed when the manifest now goes elsewhere. Uninstall removes the
+`gigabyte-gpu-rgb` subdirectory from the override, `/etc/coolercontrol/plugins`
+(resolved) and `/var/lib/coolercontrol/plugins`, and nothing else.
 
 ## systemd unit
 

@@ -4,13 +4,12 @@
 # so the host needs only podman. Set CONTAINER=0 to use a local cargo + protoc.
 #
 #   make build     release binary -> build/cc-gigabyte-gpu-rgb
-#   make test      cargo test
+#   make test      cargo test + install.sh tests (DESTDIR, no root)
 #   make lint      cargo fmt --check + cargo clippy -D warnings
-#   make check     test + lint
-#   sudo make install / sudo make uninstall   (no build, no podman as root)
-#   sudo make install MANIFEST_PLUGINS_DIR=/etc/coolercontrol/plugins
-#                  for the official CoolerControl container image (see README);
-#                  pass the same value to uninstall.
+#   make check     test + lint (incl. shellcheck)
+#   make dist      static musl release archive -> build/dist/ (as published by CI)
+#   sudo make install / sudo make uninstall   via install.sh (no build, no podman as root)
+#   sudo make install MANIFEST_PLUGINS_DIR=DIR   override the manifest location
 
 .DEFAULT_GOAL := build
 
@@ -37,35 +36,43 @@ RUN :=
 TARGET_DIR := target
 endif
 
-# --- install locations ---------------------------------------------------------
+# --- release archive (make dist) -----------------------------------------------
+# A static musl binary plus everything needed to install it, as published by CI.
+MUSL        := x86_64-unknown-linux-musl
+VERSION     := $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+DIST_NAME   := $(NAME)-$(VERSION)-x86_64-linux
+DIST_OUT    := build/dist
+DIST_IMAGE  ?= localhost/$(NAME)-dist:latest
+DIST_VOL    ?= $(NAME)-dist-target
+SOURCE_DATE_EPOCH ?= $(shell git log -1 --format=%ct 2>/dev/null || date +%s)
+
+ifeq ($(CONTAINER),1)
+DIST_RUN := $(PODMAN) run --rm --init \
+	-v "$(CURDIR)":/src:z \
+	-v $(CARGO_VOL):/opt/cargo/registry \
+	-v $(DIST_VOL):/target \
+	-e CARGO_TARGET_DIR=/target \
+	-w /src $(DIST_IMAGE)
+DIST_TARGET_DIR := /target
+else
+DIST_RUN :=
+DIST_TARGET_DIR := target
+endif
+
+# --- install (delegated to install.sh) -------------------------------------------
+# MANIFEST_PLUGINS_DIR: CoolerControl plugins directory for the manifest. Empty means
+# install.sh chooses (and prints) it. DESTDIR stages without root or systemd.
 DESTDIR     ?=
-BINDIR      ?= /usr/local/bin
-UNITDIR     ?= /etc/systemd/system
-MODLOADDIR  ?= /etc/modules-load.d
-
-# Where the service creates its socket. Fixed: the same path is hardcoded in
-# dist/cc-gigabyte-gpu-rgb.service (--socket, ReadWritePaths=), dist/manifest.toml
-# (address) and DEFAULT_SOCKET in src/lib.rs.
-SOCKET_DIR  := /var/lib/coolercontrol/plugins/$(PLUGIN_ID)
-
-# Auto-save records. Fixed: StateDirectory= in the unit and DEFAULT_STATE_DIR in
-# src/autosave.rs. systemd creates it; uninstall removes it.
-STATE_DIR   := /var/lib/$(NAME)
-
-# The plugins directory the CoolerControl daemon scans for manifests. Native
-# packages use /var/lib/coolercontrol/plugins; the official container image sets
-# CC_DATA_DIR=/etc/coolercontrol and so scans /etc/coolercontrol/plugins.
-MANIFEST_PLUGINS_DIR ?= /var/lib/coolercontrol/plugins
-MANIFEST_DIR := $(MANIFEST_PLUGINS_DIR)/$(PLUGIN_ID)
+MANIFEST_PLUGINS_DIR ?=
 
 ifdef PLUGINS_DIR
 $(error PLUGINS_DIR is no longer used; set MANIFEST_PLUGINS_DIR (where the manifest goes) instead)
 endif
 
-# Refuses an empty or relative MANIFEST_PLUGINS_DIR before anything is installed or removed.
-CHECK_DIRS = case "$(MANIFEST_PLUGINS_DIR)" in /?*) ;; *) echo "MANIFEST_PLUGINS_DIR must be an absolute path"; exit 1;; esac
+INSTALL_SH = BINARY="$(CURDIR)/build/$(NAME)" DESTDIR="$(DESTDIR)" \
+	MANIFEST_PLUGINS_DIR="$(MANIFEST_PLUGINS_DIR)" ./install.sh
 
-.PHONY: image build test lint fmt check clean install uninstall
+.PHONY: image dist-image build dist test lint fmt check clean install uninstall
 
 image:
 ifeq ($(CONTAINER),1)
@@ -82,12 +89,36 @@ else
 endif
 	@echo "Built build/$(NAME)"
 
+dist-image:
+ifeq ($(CONTAINER),1)
+	$(PODMAN) build -t $(DIST_IMAGE) -f Containerfile.dist .
+endif
+
+# build/dist/$(DIST_NAME).tar.gz and .sha256
+dist: dist-image
+	@test -n "$(VERSION)" || { echo "cannot read version from Cargo.toml"; exit 1; }
+	$(DIST_RUN) cargo build --locked --release --target $(MUSL)
+	rm -rf build/dist
+	mkdir -p $(DIST_OUT)/$(DIST_NAME)
+ifeq ($(CONTAINER),1)
+	$(DIST_RUN) cp $(DIST_TARGET_DIR)/$(MUSL)/release/$(NAME) /src/$(DIST_OUT)/$(DIST_NAME)/$(NAME)
+else
+	cp $(DIST_TARGET_DIR)/$(MUSL)/release/$(NAME) $(DIST_OUT)/$(DIST_NAME)/$(NAME)
+endif
+	cp -R install.sh README.md LICENSE dist docs $(DIST_OUT)/$(DIST_NAME)/
+	cd $(DIST_OUT) && tar --sort=name --owner=0 --group=0 --numeric-owner \
+		--mtime=@$(SOURCE_DATE_EPOCH) -cf - $(DIST_NAME) | gzip -n -9 > $(DIST_NAME).tar.gz
+	cd $(DIST_OUT) && sha256sum $(DIST_NAME).tar.gz > $(DIST_NAME).tar.gz.sha256
+	@echo "Built $(DIST_OUT)/$(DIST_NAME).tar.gz"
+
 test: image
 	$(RUN) cargo test --locked
+	$(RUN) sh tests/install_sh.sh
 
 lint: image
 	$(RUN) cargo fmt --check
 	$(RUN) cargo clippy --locked --all-targets -- -D warnings
+	$(RUN) shellcheck -s sh install.sh tests/install_sh.sh
 
 fmt: image
 	$(RUN) cargo fmt
@@ -100,40 +131,11 @@ ifeq ($(CONTAINER),1)
 	-$(PODMAN) volume rm $(TARGET_VOL)
 endif
 
-# Installs the already built binary. Run `make build` first as your normal user.
-# Idempotent: re-running replaces the files and restarts the service.
+# Installs the already built binary (run `make build` first, as your user) through
+# install.sh, the single implementation shared with the release archive.
 install:
-	@if [ "$$(id -u)" != 0 ] && [ -z "$(DESTDIR)" ]; then echo "install must run as root (sudo make install)"; exit 1; fi
 	@if [ ! -x build/$(NAME) ]; then echo "build/$(NAME) not found; run 'make build' first (not as root)"; exit 1; fi
-	@$(CHECK_DIRS)
-	install -D -m 0755 build/$(NAME) $(DESTDIR)$(BINDIR)/$(NAME)
-	install -D -m 0644 dist/$(NAME).service $(DESTDIR)$(UNITDIR)/$(NAME).service
-	install -D -m 0644 dist/modules-load.conf $(DESTDIR)$(MODLOADDIR)/$(NAME).conf
-	install -d -m 0755 $(DESTDIR)$(SOCKET_DIR)
-	install -d -m 0755 $(DESTDIR)$(MANIFEST_DIR)
-	install -m 0644 dist/manifest.toml $(DESTDIR)$(MANIFEST_DIR)/manifest.toml
-	@if [ -z "$(DESTDIR)" ]; then \
-		if command -v restorecon >/dev/null 2>&1; then \
-			restorecon -F $(BINDIR)/$(NAME) $(UNITDIR)/$(NAME).service $(MODLOADDIR)/$(NAME).conf || true; \
-			restorecon -RF $(SOCKET_DIR) $(MANIFEST_DIR) || true; \
-		fi; \
-		modprobe i2c-dev || true; \
-		systemctl daemon-reload; \
-		systemctl enable $(NAME).service; \
-		systemctl restart $(NAME).service; \
-		echo "Installed. Manifest: $(MANIFEST_DIR)/manifest.toml, socket directory: $(SOCKET_DIR)."; \
-		echo "Now restart CoolerControl (coolercontrold.service, or your container unit)."; \
-	fi
+	$(INSTALL_SH)
 
 uninstall:
-	@if [ "$$(id -u)" != 0 ] && [ -z "$(DESTDIR)" ]; then echo "uninstall must run as root"; exit 1; fi
-	@$(CHECK_DIRS)
-	-@if [ -z "$(DESTDIR)" ]; then systemctl disable --now $(NAME).service; fi
-	rm -f $(DESTDIR)$(UNITDIR)/$(NAME).service
-	rm -f $(DESTDIR)$(BINDIR)/$(NAME)
-	rm -f $(DESTDIR)$(MODLOADDIR)/$(NAME).conf
-	rm -rf $(DESTDIR)$(MANIFEST_DIR)
-	rm -rf $(DESTDIR)$(SOCKET_DIR)
-	rm -rf $(DESTDIR)$(STATE_DIR)
-	-@if [ -z "$(DESTDIR)" ]; then systemctl daemon-reload; fi
-	@echo "Uninstalled. Restart CoolerControl so it forgets the plugin."
+	$(INSTALL_SH) --uninstall

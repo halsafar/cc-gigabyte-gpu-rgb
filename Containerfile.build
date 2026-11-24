@@ -6,7 +6,7 @@
 FROM registry.fedoraproject.org/fedora:45
 
 RUN dnf -y install --setopt=install_weak_deps=False \
-        cargo rust clippy rustfmt gcc protobuf-compiler protobuf-devel \
+        cargo rust clippy rustfmt gcc protobuf-compiler protobuf-devel ShellCheck \
     && dnf clean all
 
 WORKDIR /src

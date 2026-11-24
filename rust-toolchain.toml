@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Toolchain for CI and release builds (rustup reads this file automatically).
+# Pinned so that a new stable release cannot change clippy's verdict or the shipped
+# binary without a commit. Bump deliberately. The Fedora container used by
+# `make build`/`make check` has its own (non-rustup) toolchain and ignores this file.
+[toolchain]
+channel = "1.99.1"
+profile = "minimal"
+components = ["clippy", "rustfmt"]
+targets = ["x86_64-unknown-linux-musl"]

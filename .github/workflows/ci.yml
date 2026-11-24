@@ -1,0 +1,128 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Checks every push to main and every pull request, and builds the release archive.
+# A pushed tag v<version> additionally publishes a GitHub Release with that archive.
+# See docs/build.md ("CI and releases").
+#
+# Actions are pinned by full commit SHA (the tag in the comment is for humans);
+# Dependabot (.github/dependabot.yml) proposes updates.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Never cancel a release run half-way.
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Check and build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # SOURCE_DATE_EPOCH for a reproducible archive comes from the last commit.
+          fetch-depth: 1
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler
+
+      # rustup is preinstalled on GitHub's Ubuntu runners; no toolchain action needed.
+      - name: Install Rust (version from rust-toolchain.toml)
+        run: |
+          channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$channel" --profile minimal \
+            --component clippy,rustfmt --target x86_64-unknown-linux-musl
+          rustc --version
+          cargo --version
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --locked
+
+      - name: Shell scripts
+        run: |
+          shellcheck -s sh install.sh tests/install_sh.sh
+          sh tests/install_sh.sh
+
+      - name: Release archive (static musl)
+        run: make dist CONTAINER=0
+
+      - name: Check the binary is static
+        run: |
+          bin=$(ls build/dist/*/cc-gigabyte-gpu-rgb)
+          file "$bin"
+          file "$bin" | grep -q 'static'
+          "$bin" --version
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-archive
+          path: |
+            build/dist/*.tar.gz
+            build/dist/*.tar.gz.sha256
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: check
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Tag must match the version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          crate=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          manifest=$(sed -n 's/^version = "\(.*\)"/\1/p' dist/manifest.toml | head -n 1)
+          echo "tag=$tag Cargo.toml=$crate dist/manifest.toml=$manifest"
+          if [ "$tag" != "$crate" ] || [ "$tag" != "$manifest" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match version $crate (Cargo.toml) / $manifest (dist/manifest.toml)"
+            exit 1
+          fi
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-archive
+          path: release
+
+      - name: Verify checksum
+        working-directory: release
+        run: sha256sum -c ./*.sha256
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" release/* \
+            --verify-tag --generate-notes --title "$GITHUB_REF_NAME"

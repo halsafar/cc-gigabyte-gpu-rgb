@@ -49,53 +49,59 @@ offered ([why](docs/protocol.md#modes-left-out)).
 ## Install
 
 The plugin runs as its own systemd service on the host; CoolerControl connects to it
-through a socket.
+through a socket. Releases ship a static x86-64 binary that runs on any Linux
+distribution with systemd. You need no Rust and no build tools.
 
-```sh
-make build                                # as your user; builds in a Podman container
-sudo make install                         # installs, enables and starts the service
-sudo systemctl restart coolercontrold     # or your CoolerControl container's unit
-```
+1. Download the archive and its checksum from the
+   [latest release](https://github.com/halsafar/cc-gigabyte-gpu-rgb/releases/latest),
+   check it, and unpack it:
 
-If you run CoolerControl in a container, read the next section first. Building needs
-only Podman and `make`; for other options see [docs/build.md](docs/build.md).
+   ```sh
+   V=0.1.0   # the release version
+   base=https://github.com/halsafar/cc-gigabyte-gpu-rgb/releases/download/v$V
+   curl -LO $base/cc-gigabyte-gpu-rgb-$V-x86_64-linux.tar.gz
+   curl -LO $base/cc-gigabyte-gpu-rgb-$V-x86_64-linux.tar.gz.sha256
+   sha256sum -c cc-gigabyte-gpu-rgb-$V-x86_64-linux.tar.gz.sha256
+   tar xzf cc-gigabyte-gpu-rgb-$V-x86_64-linux.tar.gz
+   cd cc-gigabyte-gpu-rgb-$V-x86_64-linux
+   ```
 
-`make install` is idempotent. It installs:
+2. Install, then restart CoolerControl:
+
+   ```sh
+   sudo ./install.sh
+   sudo systemctl restart coolercontrold     # or your CoolerControl container's unit
+   ```
+
+`install.sh` is idempotent; run it again to update. It installs:
 
 | What | Where |
 |---|---|
 | binary | `/usr/local/bin/cc-gigabyte-gpu-rgb` |
-| systemd unit | `/etc/systemd/system/cc-gigabyte-gpu-rgb.service` |
+| systemd unit | `/etc/systemd/system/cc-gigabyte-gpu-rgb.service` (enabled and started) |
 | `i2c-dev` autoload | `/etc/modules-load.d/cc-gigabyte-gpu-rgb.conf` |
-| manifest | `/var/lib/coolercontrol/plugins/gigabyte-gpu-rgb/manifest.toml` (see below) |
+| manifest | `<plugins dir>/gigabyte-gpu-rgb/manifest.toml`; the script picks the plugins directory and prints which one and why |
 | socket | `/var/lib/coolercontrol/plugins/gigabyte-gpu-rgb/gigabyte-gpu-rgb.sock` |
 | save records | `/var/lib/cc-gigabyte-gpu-rgb/` |
 
-To install by hand, copy the files from `dist/` to those places, create the socket
-directory, and run `sudo systemctl daemon-reload && sudo systemctl enable --now
-cc-gigabyte-gpu-rgb`. Keep the binary out of the plugins directory: on SELinux systems
-systemd cannot execute files there (`status=203/EXEC`).
+To put the manifest somewhere else, use `sudo ./install.sh --manifest-dir DIR`.
+
+**From source** instead: `make build` as your user (needs only Podman and `make`), then
+`sudo make install`, which runs the same `install.sh`. See [docs/build.md](docs/build.md).
 
 ### CoolerControl in a container
 
-The official CoolerControl container image looks for plugins in
-`/etc/coolercontrol/plugins`, not `/var/lib/coolercontrol/plugins`. With the default
-install the daemon never sees the plugin. Two requirements and one fix:
+The official container image reads plugins from `/etc/coolercontrol/plugins`, not
+`/var/lib/coolercontrol/plugins`. `install.sh` notices this: if
+`/etc/coolercontrol/plugins` is a real directory, it puts the manifest there. A native
+CoolerControl turns that path into a symlink, and the script follows it. What you need:
 
-- `/var/lib/coolercontrol` must be bind-mounted into the container at the same path,
-  because the socket lives there.
-- Then either install the manifest where the container looks (this also needs
-  `/etc/coolercontrol` mounted):
-
-  ```sh
-  sudo make install MANIFEST_PLUGINS_DIR=/etc/coolercontrol/plugins
-  ```
-
-  or keep the default install and set `CC_PLUGINS_DIR=/var/lib/coolercontrol/plugins`
-  in the container's environment (`Environment=` in a Podman quadlet's `[Container]`
-  section, or `-e` for `podman run`/`docker run`), then recreate the container.
-
-Restart the container afterwards.
+- `/var/lib/coolercontrol` and `/etc/coolercontrol` bind-mounted into the container at
+  the same paths. The socket is under `/var/lib/coolercontrol`.
+- Start the container once before installing, so `/etc/coolercontrol/plugins` exists.
+  Otherwise pass `--manifest-dir /etc/coolercontrol/plugins`.
+- Alternatively, set `CC_PLUGINS_DIR=/var/lib/coolercontrol/plugins` in the container's
+  environment and install with `--manifest-dir /var/lib/coolercontrol/plugins`.
 
 ### Check it works
 
@@ -154,7 +160,7 @@ Details: [docs/design.md](docs/design.md#auto-save).
 | `No supported card found` | Load `i2c-dev` (`sudo modprobe i2c-dev`), check your card's IDs against the table, run `probe` with `--debug`. |
 | `cannot open /dev/i2c-N: Permission denied` | Run as root. Under systemd, `i2c-dev` must be loaded before the service starts; restart the service after loading it by hand. |
 | Probe fails, or the reply is `ab ab ab ab` / `00 00 00 00` | That bus or address has no compatible controller. Do not force writes. |
-| Service fails with `status=226/NAMESPACE` | `/var/lib/coolercontrol/plugins/gigabyte-gpu-rgb` is missing. Re-run `sudo make install`. |
+| Service fails with `status=226/NAMESPACE` | `/var/lib/coolercontrol/plugins/gigabyte-gpu-rgb` is missing. Re-run `sudo ./install.sh`. |
 | `cannot bind ...` / permission denied on the socket | The plugin directory must be owned by root (the service runs as root without capabilities). |
 | Card shows another look at power-on or after resume | The setting changed less than 30 s before shutdown or suspend, or something else rewrote the card. Run `sudo cc-gigabyte-gpu-rgb save` once. Each save is logged as `saved the lighting setting to the card's memory`. |
 | Some LEDs stay dark or colours look wrong | Please report your card and what lights. |
@@ -162,11 +168,11 @@ Details: [docs/design.md](docs/design.md#auto-save).
 ## Uninstall
 
 ```sh
-sudo make uninstall          # add MANIFEST_PLUGINS_DIR=... if you used it to install
+sudo ./install.sh --uninstall     # or: sudo make uninstall
 ```
 
 This removes the binary, the unit, the modules-load file, the plugin's own directories
-and the save records, then you restart CoolerControl.
+(wherever the manifest was put) and the save records. Then restart CoolerControl.
 
 ## Safety
 

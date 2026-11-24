@@ -12,46 +12,77 @@
 
 | Target | What it does |
 |---|---|
-| `make build` | `cargo build --locked --release`, copies the binary to `build/cc-gigabyte-gpu-rgb` |
-| `make test` | `cargo test --locked` |
-| `make lint` | `cargo fmt --check` and `cargo clippy --locked --all-targets -- -D warnings` |
+| `make build` | `cargo build --locked --release` (glibc, for local use), copies the binary to `build/cc-gigabyte-gpu-rgb` |
+| `make dist` | static musl release archive in `build/dist/` (below) |
+| `make test` | `cargo test --locked` and `tests/install_sh.sh` |
+| `make lint` | `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`, `shellcheck` on the shell scripts |
 | `make check` | `test` + `lint` |
 | `make fmt` | `cargo fmt` |
-| `make image` | builds the build container image (done by the targets above) |
+| `make image` / `make dist-image` | build the container images (done by the targets above) |
 | `make clean` | removes `build/` and `target/`, and the target-cache volume |
-| `sudo make install` / `sudo make uninstall` | see the [README](../README.md#install) |
+| `sudo make install` / `sudo make uninstall` | runs `install.sh` with `build/cc-gigabyte-gpu-rgb` |
 
 By default every cargo command runs in a container built from
 [`Containerfile.build`](../Containerfile.build): `fedora:45` with cargo, rust, clippy,
-rustfmt, gcc and protobuf-compiler. The repo is mounted at `/src` with `:z` (SELinux).
-The cargo registry and the target directory live in the named volumes
+rustfmt, gcc, protobuf-compiler and ShellCheck. The repo is mounted at `/src` with `:z`
+(SELinux). The cargo registry and the target directory live in the named volumes
 `cc-gigabyte-gpu-rgb-cargo` and `cc-gigabyte-gpu-rgb-target`, so rebuilds are fast.
 Variables: `PODMAN`, `IMAGE`, `CARGO_VOL`, `TARGET_VOL`.
 
-The binary is linked against the container's glibc (Fedora 45). It runs on Fedora 45 or
-anything with a glibc at least as new. On another distribution, use `CONTAINER=0` or
-change the image.
+The `make build` binary is linked against the container's glibc (Fedora 45). It runs on
+Fedora 45 or anything with a glibc at least as new. For a binary that runs anywhere, use
+`make dist`.
 
 Without a container:
 
 ```sh
 make CONTAINER=0 build      # or: cargo build --locked --release
 make CONTAINER=0 check
+make CONTAINER=0 dist       # needs rustup with the musl target (rust-toolchain.toml)
 ```
 
 `Cargo.lock` is committed and every target uses `--locked`. To change dependencies, run
 `cargo update` (or a build without `--locked`) once and commit the new lock file.
 
-## Building for install
+## Release archive (`make dist`)
+
+`make dist` builds `--target x86_64-unknown-linux-musl`. That gives a static-pie
+binary with no glibc or libgcc dependency, so it runs on any x86-64 Linux. All
+dependencies are pure Rust plus libc. The build runs in a second container,
+[`Containerfile.dist`](../Containerfile.dist) (`fedora:45` with rustup, because Fedora's
+Rust packages lack the musl target), using the toolchain pinned in
+[`rust-toolchain.toml`](../rust-toolchain.toml), the same one CI uses. Its target cache
+is the volume `cc-gigabyte-gpu-rgb-dist-target`.
+
+Output, for version `V` from `Cargo.toml`:
+
+```
+build/dist/cc-gigabyte-gpu-rgb-V-x86_64-linux.tar.gz
+build/dist/cc-gigabyte-gpu-rgb-V-x86_64-linux.tar.gz.sha256
+```
+
+The archive contains one directory `cc-gigabyte-gpu-rgb-V-x86_64-linux/` with the binary,
+`install.sh`, `dist/` (unit, manifest, modules-load file), `README.md`, `LICENSE` and
+`docs/`. It is reproducible: sorted entries, owner 0/0, mtime from the last commit
+(`SOURCE_DATE_EPOCH`), `gzip -n`. Two runs from the same commit give the same checksum.
+
+## Installing
+
+`install.sh` is the only install implementation. The release archive runs it directly
+(`sudo ./install.sh`). The Makefile calls it with `BINARY=build/cc-gigabyte-gpu-rgb`:
 
 ```sh
 make build              # as your user, not as root
-sudo make install       # installs build/cc-gigabyte-gpu-rgb; never builds
+sudo make install       # never builds, never starts Podman as root
 ```
 
-`install` refuses to run without `build/cc-gigabyte-gpu-rgb` and does not start Podman
-as root. `DESTDIR=...` stages the files into a directory without needing root or
-touching systemd; that is how the install target is tested:
+Options and environment: `--uninstall`; `--manifest-dir DIR` or `MANIFEST_PLUGINS_DIR`
+(must be absolute); `DESTDIR` stages into a directory without root or systemd; `BINARY`
+sets the binary to install. The old `PLUGINS_DIR` variable is rejected by the Makefile.
+How the manifest directory is chosen is described in
+[design.md](design.md#how-installsh-picks-the-manifest-directory).
+
+Staging by hand:
 
 ```sh
 make install DESTDIR=/tmp/stage
@@ -59,8 +90,63 @@ make install DESTDIR=/tmp/stage MANIFEST_PLUGINS_DIR=/etc/coolercontrol/plugins
 make uninstall DESTDIR=/tmp/stage
 ```
 
-`MANIFEST_PLUGINS_DIR` must be an absolute path. The old `PLUGINS_DIR` variable is
-rejected.
+`tests/install_sh.sh` runs these cases automatically against fake trees:
+
+- native default
+- container (real `/etc/coolercontrol/plugins`, plus a stale manifest)
+- native symlink (an absolute link that must not escape `DESTDIR`)
+- override
+- refusals
+
+It runs in `make test` and in CI.
+
+## CI and releases
+
+[`.github/workflows/ci.yml`](../.github/workflows/ci.yml) runs on pushes to `main`, on
+pull requests and on tags `v*`:
+
+- **check** (every run):
+  1. install protoc (apt) and the pinned toolchain (rustup is preinstalled on the
+     runner)
+  2. `cargo fmt --check`, clippy with `-D warnings`, `cargo test`, all `--locked`
+  3. shellcheck and `tests/install_sh.sh`
+  4. `make dist CONTAINER=0`, a check that the binary is static
+  5. upload the archive and checksum as the workflow artifact `release-archive`, so
+     every build can be downloaded
+- **release** (tags only, after check):
+  1. fails unless the tag minus `v` equals the version in `Cargo.toml` *and* in
+     `dist/manifest.toml`
+  2. downloads the artifact, verifies the checksum
+  3. runs `gh release create <tag> --verify-tag --generate-notes` with both files. Only
+     this job has `contents: write`; everything else is read-only.
+
+Superseded runs on the same branch are cancelled; tag runs are never cancelled. Cargo
+downloads and `target/` are cached with `actions/cache`, keyed on `Cargo.lock` and
+`rust-toolchain.toml`.
+
+Actions are pinned by full commit SHA, with the version in a comment. Tags can be moved
+by whoever controls the action's repository; a SHA cannot. Only GitHub's own actions are
+used (checkout, cache, upload-artifact, download-artifact).
+[`.github/dependabot.yml`](../.github/dependabot.yml) proposes monthly updates.
+
+### Cutting a release
+
+1. Bump `version` in `Cargo.toml` **and** `dist/manifest.toml` (the release job
+   checks both). Update the lock file with `cargo update -p cc-gigabyte-gpu-rgb --offline`
+   (or one build without `--locked`), run `make check`, and commit.
+2. Optionally `make dist` and try the archive.
+3. Tag and push:
+
+   ```sh
+   git tag -a v0.2.0 -m "v0.2.0"
+   git push origin main v0.2.0
+   ```
+
+4. The workflow publishes the release with generated notes. Edit the notes on GitHub if
+   needed.
+
+To change the Rust version, edit `rust-toolchain.toml` (CI and `make dist`). The Fedora
+container used by `make build`/`make check` has its own toolchain.
 
 ## Repository layout
 
@@ -75,10 +161,14 @@ rejected.
 | `src/server.rs` | Unix-socket serving, stale-socket removal, socket mode |
 | `src/lib.rs` | generated proto modules, `open_device`, `detect_devices`, `DEFAULT_SOCKET` |
 | `src/main.rs` | CLI (`serve`, `probe`, `set`, `save`), logging, signals |
+| `install.sh` | installer / uninstaller (POSIX sh), used by the release archive and `make install` |
+| `tests/install_sh.sh` | `install.sh` tests in `DESTDIR` trees |
 | `tests/grpc.rs` | end-to-end tests over a real Unix socket with a tonic client and the mock bus |
 | `tests/autosave.rs` | auto-save behaviour with the mock bus and paused tokio time |
 | `proto/` | CoolerControl gRPC API, vendored unmodified from `cc-plugins` commit `47edcf3a` |
 | `dist/` | systemd unit, plugin manifest, modules-load file |
+| `Containerfile.build`, `Containerfile.dist`, `rust-toolchain.toml` | build environments (local; release/CI toolchain) |
+| `.github/` | CI and release workflow, Dependabot config |
 | `docs/` | this file, [protocol.md](protocol.md), [design.md](design.md), [adding-a-card.md](adding-a-card.md) |
 | `build.rs` | proto code generation (server and client; the client is only used by tests) |
 
