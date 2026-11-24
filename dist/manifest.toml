@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# CoolerControl plugin manifest for cc-gigabyte-gpu-rgb.
+# Install to <plugins dir>/gigabyte-gpu-rgb/manifest.toml, where <plugins dir> is the
+# directory the CoolerControl daemon scans: /var/lib/coolercontrol/plugins for native
+# packages, /etc/coolercontrol/plugins for the official container image (see README).
+# The socket below stays under /var/lib/coolercontrol either way.
+
+id = "gigabyte-gpu-rgb"
+type = "device"
+description = "Gigabyte RGB Fusion 2 GPU lighting over I2C (cc-gigabyte-gpu-rgb)"
+version = "0.1.0"
+url = "https://github.com/halsafar/cc-gigabyte-gpu-rgb"
+
+# Unix socket the service listens on. Must match `--socket` in the systemd unit.
+address = "/var/lib/coolercontrol/plugins/gigabyte-gpu-rgb/gigabyte-gpu-rgb.sock"
+
+# No `executable` on purpose: CoolerControl does not start or manage this service.
+# It is run by systemd (cc-gigabyte-gpu-rgb.service), so it also works when the
+# CoolerControl daemon runs in a container. `privileged`, `args` and `envs` only
+# apply to services CoolerControl starts, so they are not set.

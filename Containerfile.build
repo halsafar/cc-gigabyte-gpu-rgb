@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Build environment for cc-gigabyte-gpu-rgb. Used by `make build` / `make test`
+# so that no Rust toolchain or protoc has to be installed on the host.
+# The resulting binary links against glibc and runs on a Fedora 45 host.
+FROM registry.fedoraproject.org/fedora:45
+
+RUN dnf -y install --setopt=install_weak_deps=False \
+        cargo rust clippy rustfmt gcc protobuf-compiler protobuf-devel \
+    && dnf clean all
+
+WORKDIR /src

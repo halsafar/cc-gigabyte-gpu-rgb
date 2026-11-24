@@ -1,0 +1,76 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# CoolerControl device-service plugin for Gigabyte GPU lighting.
+# Install to /etc/systemd/system/cc-gigabyte-gpu-rgb.service.
+#
+# CoolerControl does not start this service (the manifest has no `executable`);
+# systemd does, before the daemon, and the daemon connects to the socket.
+
+[Unit]
+Description=CoolerControl plugin: Gigabyte GPU lighting over I2C
+# /dev/i2c-* only exists once i2c-dev is loaded, and DeviceAllow=char-i2c is
+# resolved from /proc/devices when the service starts.
+Wants=systemd-modules-load.service
+After=systemd-modules-load.service
+# Native package unit and the usual container unit names.
+Before=coolercontrold.service coolercontrol.service
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/cc-gigabyte-gpu-rgb serve --socket /var/lib/coolercontrol/plugins/gigabyte-gpu-rgb/gigabyte-gpu-rgb.sock
+Restart=on-failure
+RestartSec=3
+# A pending auto-save is flushed on SIGTERM (bounded at 5 s by the service).
+TimeoutStopSec=15
+
+# Auto-save records what is stored in each card's memory here
+# (/var/lib/cc-gigabyte-gpu-rgb, passed as $STATE_DIRECTORY). systemd creates it
+# owned by root and makes it writable despite ProtectSystem=strict.
+# To turn auto-save off, add --no-auto-save to ExecStart.
+StateDirectory=cc-gigabyte-gpu-rgb
+StateDirectoryMode=0700
+
+# Runs as root (the i2c device nodes and the plugin directory are root's) but
+# with no capabilities and a read-only view of the system.
+UMask=0077
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+
+# Devices: only I2C character devices (major "i2c" in /proc/devices).
+# Do not add PrivateDevices=yes: it would hide /dev/i2c-*.
+DevicePolicy=closed
+DeviceAllow=char-i2c rw
+
+# Filesystem: everything read-only except the plugin directory (for the socket)
+# and the StateDirectory above.
+# /dev, /proc and /sys stay visible; sysfs is only read.
+ProtectSystem=strict
+ReadWritePaths=/var/lib/coolercontrol/plugins/gigabyte-gpu-rgb
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+
+# Network: none. A Unix socket bound to a filesystem path still works across
+# network namespaces, so CoolerControl (even in a container) can connect.
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target
